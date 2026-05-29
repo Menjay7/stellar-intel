@@ -3,6 +3,7 @@ import type { Sep10Auth } from '@/types'
 const DEFAULT_CAPACITY = 32
 
 const cache = new Map<string, Sep10Auth>()
+const pendingRequests = new Map<string, Promise<Sep10Auth>>()
 let capacity = DEFAULT_CAPACITY
 
 function key(anchorDomain: string, publicKey: string): string {
@@ -46,9 +47,62 @@ export function invalidateCachedJwt(anchorDomain: string, publicKey: string): vo
 
 export function clearJwtCache(): void {
   cache.clear()
+  pendingRequests.clear()
 }
 
 export function setJwtCacheCapacity(n: number): void {
   capacity = Math.max(1, n)
   evictIfOverCapacity()
+}
+
+/**
+ * Deduplicate concurrent authentication requests for the same anchor/public key.
+ * If a request is already in-flight, return its promise. Otherwise, execute the
+ * provided fetcher and cache the result.
+ */
+export async function withDedupedAuth(
+  anchorDomain: string,
+  publicKey: string,
+  fetcher: () => Promise<Sep10Auth>
+): Promise<Sep10Auth> {
+  const k = key(anchorDomain, publicKey)
+
+  // Check if there's already a pending request for this key
+  const existing = pendingRequests.get(k)
+  if (existing) {
+    return existing
+  }
+
+  // Create new request and store it
+  const promise = fetcher()
+    .then((result) => {
+      // On success, cache the result and remove from pending
+      setCachedJwt(result)
+      pendingRequests.delete(k)
+      return result
+    })
+    .catch((error) => {
+      // On error, remove from pending and re-throw
+      pendingRequests.delete(k)
+      throw error
+    })
+
+  pendingRequests.set(k, promise)
+  return promise
+}
+
+/**
+ * Get cached JWT even if expired (stale-while-revalidate pattern).
+ * Returns undefined only if completely missing from cache.
+ * Caller should check expiresAt to determine if data is stale.
+ */
+export function getCachedJwtOrStale(anchorDomain: string, publicKey: string): Sep10Auth | undefined {
+  const k = key(anchorDomain, publicKey)
+  const entry = cache.get(k)
+  if (!entry) return undefined
+
+  // Move to end → most-recently-used
+  cache.delete(k)
+  cache.set(k, entry)
+  return entry
 }

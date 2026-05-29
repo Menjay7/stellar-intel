@@ -1,7 +1,7 @@
 import { Networks, TransactionBuilder } from '@stellar/stellar-sdk'
 import type { Transaction, FeeBumpTransaction } from '@stellar/stellar-sdk'
 import { getWebAuthEndpoint } from './sep1'
-import { getCachedJwt, setCachedJwt, invalidateCachedJwt } from './jwt-cache'
+import { getCachedJwt, setCachedJwt, invalidateCachedJwt, withDedupedAuth, getCachedJwtOrStale } from './jwt-cache'
 import type { ResolvedAnchor, Sep10Auth } from '@/types'
 import { UserRejectedError } from './errors'
 
@@ -226,13 +226,32 @@ export async function authenticate(
   if (!webAuthEndpoint || !anchor.capabilities.sep10) {
     throw new Error(`Anchor "${anchor.homeDomain}" does not support SEP-10 authentication.`)
   }
-  const { transaction, network_passphrase } = await fetchChallenge(webAuthEndpoint, publicKey)
-  const signedXdr = await signChallenge(transaction, network_passphrase)
-  const { token: jwt, expiresAt } = await submitChallenge(webAuthEndpoint, signedXdr)
 
-  const auth: Sep10Auth = { jwt, anchorDomain: anchor.homeDomain, publicKey, expiresAt }
-  setCachedJwt(auth)
-  return auth
+  // Check for stale data for stale-while-revalidate
+  const stale = getCachedJwtOrStale(anchor.homeDomain, publicKey)
+  const isStale = stale && stale.expiresAt.getTime() <= Date.now()
+
+  // Use deduplication to prevent concurrent requests for the same anchor/public key
+  const freshPromise = withDedupedAuth(anchor.homeDomain, publicKey, async () => {
+    const { transaction, network_passphrase } = await fetchChallenge(webAuthEndpoint, publicKey)
+    const signedXdr = await signChallenge(transaction, network_passphrase)
+    const { token: jwt, expiresAt } = await submitChallenge(webAuthEndpoint, signedXdr)
+
+    const auth: Sep10Auth = { jwt, anchorDomain: anchor.homeDomain, publicKey, expiresAt }
+    return auth
+  })
+
+  // Stale-while-revalidate: return stale data immediately if available
+  if (isStale) {
+    // Trigger background revalidation without waiting
+    freshPromise.catch(() => {
+      // Silently ignore background revalidation errors
+    })
+    return stale
+  }
+
+  // No stale data, wait for fresh authentication
+  return freshPromise
 }
 
 /**
